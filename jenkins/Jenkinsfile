@@ -1,0 +1,101 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION      = 'ap-south-1'
+    ECR_REGISTRY    = "<AWS_ACCOUNT_ID>.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    FRONTEND_REPO   = 'three-tier-frontend'
+    BACKEND_REPO    = 'three-tier-backend'
+    EKS_CLUSTER     = 'three-tier-cluster'
+    K8S_NAMESPACE   = 'three-tier-app'
+    IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Install & Test Backend') {
+      steps {
+        dir('backend') {
+          sh 'npm ci'
+          sh 'npm test'
+        }
+      }
+    }
+
+    stage('Install & Build Frontend') {
+      steps {
+        dir('frontend') {
+          sh 'npm ci'
+          sh 'npm run build'
+        }
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh """
+          docker build -t ${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG} ./backend
+          docker build -t ${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG} ./frontend
+        """
+      }
+    }
+
+    stage('Image Scan') {
+      steps {
+        sh """
+          trivy image --severity HIGH,CRITICAL --exit-code 1 ${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}
+          trivy image --severity HIGH,CRITICAL --exit-code 1 ${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}
+        """
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        withAWS(credentials: 'aws-jenkins-creds', region: "${AWS_REGION}") {
+          sh """
+            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            docker push ${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}
+            docker push ${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}
+          """
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withAWS(credentials: 'aws-jenkins-creds', region: "${AWS_REGION}") {
+          sh """
+            aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+
+            kubectl -n ${K8S_NAMESPACE} set image deployment/backend backend=${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}
+            kubectl -n ${K8S_NAMESPACE} set image deployment/frontend frontend=${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}
+
+            kubectl -n ${K8S_NAMESPACE} rollout status deployment/backend --timeout=180s
+            kubectl -n ${K8S_NAMESPACE} rollout status deployment/frontend --timeout=180s
+          """
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo 'Pipeline failed — rolling back deployments.'
+      withAWS(credentials: 'aws-jenkins-creds', region: "${AWS_REGION}") {
+        sh """
+          kubectl -n ${K8S_NAMESPACE} rollout undo deployment/backend || true
+          kubectl -n ${K8S_NAMESPACE} rollout undo deployment/frontend || true
+        """
+      }
+    }
+    always {
+      sh 'docker system prune -f || true'
+    }
+  }
+}
